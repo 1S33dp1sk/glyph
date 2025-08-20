@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/test_glyph_db.sh — DB coverage for glyph
+# scripts/test_glyph_db.sh — DB coverage for glyph (portable, no sed -i)
 
 set -euo pipefail
 
@@ -8,6 +8,19 @@ PY="${PY:-python3}"
 
 msg() { printf "\033[1;34m[+] %s\033[0m\n" "$*"; }
 die() { printf "\033[1;31m[!] %s\033[0m\n" "$*" >&2; exit 1; }
+
+# portable in-place word replace (BSD/GNU sed-safe)
+repl_word() {
+  local file="$1" from="$2" to="$3"
+  "$PY" - "$file" "$from" "$to" <<'PY'
+import sys, re, pathlib
+p = pathlib.Path(sys.argv[1])
+src = p.read_text(encoding='utf-8')
+pat = re.compile(r'\b' + re.escape(sys.argv[2]) + r'\b')
+dst = pat.sub(sys.argv[3], src)
+p.write_text(dst, encoding='utf-8')
+PY
+}
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/glyphdbtest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -117,8 +130,8 @@ EOF
 
 # --- mutate util.*: rename mul_int -> mul2 and re-ingest only util.* ---
 msg "db: mutate util.* and re-ingest"
-sed -i '' 's/mul_int/mul2/g' "$DEMO/src/util.c"
-sed -i '' 's/mul_int/mul2/g' "$DEMO/include/util.h"
+repl_word "$DEMO/src/util.c" "mul_int" "mul2"
+repl_word "$DEMO/include/util.h" "mul_int" "mul2"
 $GLYPH_BIN db ingest \
   --db "$DB" \
   --file util.c@"$DEMO/src/util.c" \
