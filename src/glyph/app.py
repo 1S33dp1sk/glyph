@@ -10,9 +10,12 @@ from . import __version__
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="GLYPH — readable C marker & analysis")
 dbv = typer.Typer(help="DB ops: init, ingest, show, callers/callees, search, resolve, vacuum")
 ai = typer.Typer(help="LLM-assisted queries over a Glyph DB (Ollama-backed)")
+plan = typer.Typer(help="Repo-aware planning: explain, propose, impact, status")
 app.add_typer(dbv, name="dbv")
 app.add_typer(dbv, name="db")  # alias
 app.add_typer(ai, name="ai")
+app.add_typer(plan, name="plan")
+
 
 # ------------- helpers ----------------
 
@@ -419,8 +422,6 @@ def summary(
     typer.echo(res.to_json(indent=2 if pretty else 0), nl=True)
 
 
-
-
 @ai.command("ask")
 def ai_ask(
     q: str = typer.Argument(..., help="Natural-language question, e.g. 'what calls add_int?'"),
@@ -434,3 +435,80 @@ def ai_ask(
     from .intel import answer_question
     out = answer_question(db, q, k=k, hops=hops, model=model, endpoint=endpoint, max_chars=max_chars)
     typer.echo(out)
+
+
+
+# ------ PLANNER
+
+
+@plan.command("explain", help="Explain the codebase (basic DB metrics, optional AI summary)")
+def plan_explain(
+    db: str = typer.Option(".glyph/idx.sqlite", "--db"),
+    ai: bool = typer.Option(False, "--ai", help="Use AI to generate a natural-language summary"),
+    model: str = typer.Option("gpt-oss:20b", "--model"),
+    endpoint: str = typer.Option("http://localhost:11434", "--endpoint"),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON (repo metrics)"),
+):
+    from .planner import explain_basic, explain_with_ai
+    summary = explain_basic(db)
+    if json_out:
+        typer.echo(summary.to_json())
+        return
+    typer.echo(summary.to_markdown())
+    if ai:
+        typer.echo("\n--- AI summary ---\n")
+        typer.echo(explain_with_ai(db, model=model, endpoint=endpoint))
+
+@plan.command("propose", help="Draft a repo-aware plan; self-rate and refine until threshold")
+def plan_propose(
+    goals: str = typer.Option(..., "--goals", help='Numbered goals, e.g. "1) …; 2) …" or multi-line'),
+    resources: str = typer.Option("", "--resources", help='Constraints/tools, e.g. "X, Y, Z" or multi-line'),
+    db: str = typer.Option(".glyph/idx.sqlite", "--db"),
+    model: str = typer.Option("gpt-oss:20b", "--model"),
+    endpoint: str = typer.Option("http://localhost:11434", "--endpoint"),
+    threshold: int = typer.Option(89, "--threshold"),
+    max_iters: int = typer.Option(8, "--max-iters"),
+    fallback_after: int = typer.Option(5, "--fallback-after"),
+    fallback_threshold: int = typer.Option(80, "--fallback-threshold"),
+    style: str = typer.Option("balanced", "--style"),
+    verbose: bool = typer.Option(False, "--verbose"),
+    md: bool = typer.Option(False, "--md", help="Also render markdown"),
+):
+    from .planner import propose_plan
+    plan, trace = propose_plan(
+        db_path=db, goals_text=goals, resources_text=resources,
+        model=model, endpoint=endpoint,
+        threshold=threshold, max_iters=max_iters,
+        fallback_after=fallback_after, fallback_threshold=fallback_threshold,
+        style=style, verbose=verbose,
+    )
+    typer.echo(plan.to_json())
+    if md:
+        typer.echo("\n---\n")
+        typer.echo(plan.to_markdown())
+    if verbose and trace:
+        typer.echo("\n--- TRACE ---")
+        for t in trace:
+            typer.echo(t)
+
+@plan.command("impact", help="Show callers/callees blast radius for a symbol or file")
+def plan_impact(
+    db: str = typer.Option(".glyph/idx.sqlite", "--db"),
+    symbol: Optional[str] = typer.Option(None, "--symbol"),
+    path: Optional[str] = typer.Option(None, "--path"),
+    depth: int = typer.Option(2, "--depth"),
+    json_out: bool = typer.Option(False, "--json"),
+):
+    from .planner import impact
+    rep = impact(db, symbol=symbol, path=path, depth=depth)
+    typer.echo(rep.to_json() if json_out else rep.to_markdown())
+
+@plan.command("status", help="Evaluate a plan.json against current repo signals")
+def plan_status(
+    db: str = typer.Option(".glyph/idx.sqlite", "--db"),
+    plan_json: str = typer.Option(..., "--plan", help="Path to plan.json"),
+):
+    from .planner import status
+    out = status(db, plan_json)
+    typer.echo(json.dumps(out, indent=2))
+
