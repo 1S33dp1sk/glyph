@@ -9,8 +9,10 @@ from . import __version__
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="GLYPH — readable C marker & analysis")
 dbv = typer.Typer(help="DB ops: init, ingest, show, callers/callees, search, resolve, vacuum")
+ai = typer.Typer(help="LLM-assisted queries over a Glyph DB (Ollama-backed)")
 app.add_typer(dbv, name="dbv")
 app.add_typer(dbv, name="db")  # alias
+app.add_typer(ai, name="ai")
 
 # ------------- helpers ----------------
 
@@ -45,6 +47,23 @@ def _version(version: bool = typer.Option(False, "--version", "-V", help="Show v
     if version:
         typer.echo(f"glyph {__version__}")
         raise typer.Exit()
+
+def _cli_version() -> str:
+    import subprocess, sys
+    attempts = (
+        ["glyph", "--version"],
+        [sys.executable, "-m", "glyph", "--version"],
+    )
+    last_err = None
+    for cmd in attempts:
+        try:
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
+            if out:
+                return out  # e.g., "glyph 0.0.1"
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"cannot execute glyph CLI: {last_err!r}")
+
 
 # ------------- core commands -------------
 
@@ -106,7 +125,6 @@ def dbv_init(
         pass
     typer.echo(db)
 
-# src/glyph/app.py — replace the whole dbv_ingest() with this version
 @dbv.command("ingest")
 def dbv_ingest(
     files: List[str] = typer.Option(..., "--file", help="name@path (repeatable)"),
@@ -125,10 +143,6 @@ def dbv_ingest(
     blacklist = {"if","for","while","switch","return","sizeof","typedef","struct","union","enum"}
 
     def _fallback_calls(code: str, fns: List[REntity]) -> dict[str, set[str]]:
-        """
-        Return mapping src_gid -> set of callee names by scanning each fn body.
-        Uses byte spans from rewriter entities to slice precisely.
-        """
         calls_by_src: dict[str, set[str]] = {}
         b = code.encode("utf-8", "ignore")
         for e in fns:
@@ -142,21 +156,21 @@ def dbv_ingest(
 
     with GlyphDB(db) as gdb:
         for name, path, code in items:
-            # parse & mark
             res = rewrite_snippet(code, filename=name, extra_args=shlex.split(cflags))
             ents = list(res.entities)
-            name2gid = {e.name: e.gid for e in ents if e.kind in ("fn", "prototype")}
-            fn_ents = [e for e in ents if e.kind == "fn"]
 
-            # callgraph (AST-based)
+            # Only resolve to real function definitions
+            name2gid_defs: dict[str, str] = {e.name: e.gid for e in ents if e.kind == "fn"}
+            fn_ents: List[REntity] = [e for e in ents if e.kind == "fn"]
+
             cg = callgraph_snippet(code, filename=name, extra_args=shlex.split(cflags))
-            edges: list[tuple[str, str | None, str | None]] = []
-
-            # accumulate edges from callgraph
+            edges: List[Tuple[str, str | None, str | None]] = []
             added: dict[str, set[str]] = {}
+
+            # AST-derived edges: src must be a local definition; dst resolves only to defs
             for src in cg.roots:
                 src_name = cg.names.get(src)
-                src_gid = name2gid.get(src_name)  # only functions defined in this file
+                src_gid = name2gid_defs.get(src_name)
                 if not src_gid:
                     continue
                 dsts = set()
@@ -164,21 +178,20 @@ def dbv_ingest(
                     dst_name = cg.names.get(dst)
                     if not dst_name:
                         continue
-                    dst_gid = name2gid.get(dst_name)  # local resolution only
+                    dst_gid = name2gid_defs.get(dst_name)  # defs only
                     edges.append((src_gid, dst_gid, dst_name))
                     dsts.add(dst_name)
                 if dsts:
                     added[src_gid] = dsts
 
-            # fallback: textual scan per fn to ensure inter-file calls are recorded
+            # Fallback textual scan: same policy (defs only)
             fb = _fallback_calls(code, fn_ents)
             for src_gid, names in fb.items():
                 already = added.get(src_gid, set())
                 for dst_name in names - already:
-                    dst_gid = name2gid.get(dst_name)
+                    dst_gid = name2gid_defs.get(dst_name)  # defs only
                     edges.append((src_gid, dst_gid, dst_name))
 
-            # ingest
             gdb.ingest_file(file_path=path, entities=ents, calls=edges, file_bytes=code.encode("utf-8"))
 
     typer.echo("ok")
@@ -193,7 +206,6 @@ def dbv_show(
         ent = gdb.get_entity(gid)
         if not ent:
             raise typer.Exit(code=1)
-        # first line contains name and decl_sig for grep-friendly tests
         typer.echo(f"{ent.gid}\t{ent.kind}\t{ent.storage}\t{ent.name}\t{ent.decl_sig or ent.name}")
         typer.echo(f"{ent.file_path}:{ent.start}-{ent.end}")
         if ent.eff_sig:
@@ -230,16 +242,14 @@ def dbv_search(
     ident = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", q) is not None
     printed: set[str] = set()
     with GlyphDB(db) as gdb:
-        # 1) exact name hits first (if identifier-like)
         if ident:
             for ent in gdb.lookup_by_name(q):
-                if ent.gid in printed: 
+                if ent.gid in printed:
                     continue
                 printed.add(ent.gid)
                 typer.echo(f"{ent.gid}\t{ent.name}\t{ent.decl_sig or ''}")
                 if len(printed) >= limit:
                     return
-        # 2) FTS fallback, dedupe
         for gid, name, decl in gdb.fts_search(q, limit=limit):
             if gid in printed:
                 continue
@@ -248,7 +258,8 @@ def dbv_search(
             if len(printed) >= limit:
                 break
 
-# src/glyph/app.py — add a repo scanner that understands Makefiles
+# ------------- repo scanner (Make-aware) -------------
+
 @app.command(help="Scan a repo, optionally via make -nB, rewrite, and ingest DB")
 def scan(
     root: str = typer.Option(".", "--root"),
@@ -268,7 +279,6 @@ def scan(
     ig = set(x.strip() for x in ignore.split(",") if x.strip())
     exts = tuple(x.strip() for x in ext.split(",") if x.strip())
 
-    # harvest per-file args
     per_file: Dict[str, List[str]] = {}
     if make:
         per_file = extract_compile_commands(str(rootp), shlex.split(make), target)
@@ -295,6 +305,7 @@ def scan(
                 outp.parent.mkdir(parents=True, exist_ok=True)
                 outp.write_text(res.code, encoding="utf-8")
 
+# ------------- db maintenance -------------
 
 @dbv.command("resolve")
 def dbv_resolve(
@@ -322,3 +333,104 @@ def dbv_analyze(
     with GlyphDB(db) as gdb:
         gdb.analyze()
         typer.echo("ok")
+
+# ------------- git integration -------------
+
+git = typer.Typer(help="Git integration: plan/apply/snapshot")
+app.add_typer(git, name="git")
+
+@git.command("plan", help="Create/switch to branch, install hooks, init DB")
+def git_plan(
+    branch: str = typer.Option(..., "--branch"),
+    base: str | None = typer.Option(None, "--base"),
+    strict: bool = typer.Option(False, "--strict"),
+    db: str = typer.Option(".glyph/idx.sqlite", "--db"),
+    mirror: str = typer.Option(".glyph/mirror", "--mirror"),
+    make: str | None = typer.Option(None, "--make"),
+    cflags: str | None = typer.Option(None, "--cflags"),
+    root: str = typer.Option(".", "--root"),
+):
+    from .gitvc import plan_branch
+    res = plan_branch(root, branch, base, db_path=db, mirror_dir=mirror,
+                      make_cmd=make, cflags=cflags, strict_hooks=strict)
+    # minimal, deterministic output
+    typer.echo(f"branch: {res.branch}\npre-commit: {res.pre_commit}\npost-merge: {res.post_merge}\nDB: {res.db_path}\nmirror: {res.mirror_dir}")
+
+@git.command("snapshot", help="Create/replace annotated tag for current DB state")
+def git_snapshot(
+    db: str = typer.Option(".glyph/idx.sqlite", "--db"),
+    root: str = typer.Option(".", "--root"),
+    prefix: str = typer.Option("glyph/db", "--prefix"),
+):
+    from .gitvc import tag_db_snapshot
+    tag = tag_db_snapshot(root, db, prefix=prefix)
+    typer.echo(tag, nl=False)  # no trailing newline
+
+@git.command("apply", help="Stage .glyph, commit allow-empty, tag snapshot; prints tag")
+def git_apply(
+    message: str = typer.Option("glyph: snapshot", "--message"),
+    db: str = typer.Option(".glyph/idx.sqlite", "--db"),
+    mirror: str = typer.Option(".glyph/mirror", "--mirror"),
+    root: str = typer.Option(".", "--root"),
+    prefix: str = typer.Option("glyph/db", "--prefix"),
+):
+    from .gitvc import apply_snapshot
+    tag = apply_snapshot(root, db_path=db, mirror_dir=mirror, message=message, tag_prefix=prefix)
+    typer.echo(tag, nl=False)  # no trailing newline
+
+@git.command("push", help="Push branch and tags to remote")
+def git_push(
+    remote: str = typer.Option("origin", "--remote"),
+    branch: str | None = typer.Option(None, "--branch"),
+    root: str = typer.Option(".", "--root"),
+):
+    from .gitvc import push_with_tags
+    push_with_tags(root, remote=remote, branch=branch)
+
+
+@app.command(help="Check glyph health: env, libclang, sqlite FTS5, bundled tests")
+def doctor(
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show details for all checks"),
+):
+    from .doctor import run as _run_doctor
+    code = _run_doctor(verbose=verbose)
+    raise typer.Exit(code)
+
+
+@app.command(help="Scour a codebase and emit a full summary (files, entities, calls)")
+def summary(
+    root: str = typer.Option(".", "--root"),
+    make: str | None = typer.Option(None, "--make", help="e.g. 'make -nB all' to harvest per-file flags"),
+    target: str | None = typer.Option(None, "--target", help="make target for --make"),
+    cflags: str = typer.Option("", "--cflags", help="Fallback compiler flags"),
+    ext: str = typer.Option(".c,.h,.cc,.cpp,.cxx,.hpp,.hh,.hxx", "--ext"),
+    ignore: str = typer.Option(".git,.glyph,build", "--ignore"),
+    pretty: bool = typer.Option(True, "--pretty/--no-pretty"),
+):
+    from .summary import summarize_repo
+    res = summarize_repo(
+        root,
+        make_cmd=make,
+        make_target=target,
+        cflags=cflags,
+        ext_csv=ext,
+        ignore_csv=ignore,
+    )
+    typer.echo(res.to_json(indent=2 if pretty else 0), nl=True)
+
+
+
+
+@ai.command("ask")
+def ai_ask(
+    q: str = typer.Argument(..., help="Natural-language question, e.g. 'what calls add_int?'"),
+    db: str = typer.Option(".glyph/idx.sqlite", "--db", help="Path to Glyph DB"),
+    k: int = typer.Option(6, "--k", help="Seed results to retrieve"),
+    hops: int = typer.Option(1, "--hops", help="Neighbor expansion around seeds"),
+    model: str = typer.Option("gpt-oss:20b", "--model", help="Ollama model name"),
+    endpoint: str = typer.Option("http://localhost:11434", "--endpoint", help="Ollama HTTP endpoint"),
+    max_chars: int = typer.Option(14000, "--max-chars", help="Context size cap"),
+):
+    from .intel import answer_question
+    out = answer_question(db, q, k=k, hops=hops, model=model, endpoint=endpoint, max_chars=max_chars)
+    typer.echo(out)

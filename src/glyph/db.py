@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Sequence, Tuple
-
+import re
 from .rewriter import Entity
 
 # --- bump schema ---
@@ -127,6 +127,34 @@ def _exec_schema(conn: sqlite3.Connection) -> None:
 
 # ---------- small utils ----------
 
+def _fts_expr_from_text(q: str, max_terms: int = 6) -> str:
+    """
+    Convert natural language to a safe, high-recall FTS5 query.
+    - keep identifier-ish tokens (prefer ones with '_' or length>=4)
+    - drop obvious operators
+    - join with OR (not AND) and use prefix matches
+    """
+    toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", q)
+    if not toks:
+        return ""
+    banned = {"and", "or", "not", "near"}
+    out = []
+    seen = set()
+    for t in toks:
+        tl = t.lower()
+        if tl in banned:
+            continue
+        # prefer identifier-y tokens
+        if "_" in t or len(t) >= 4:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        if len(out) >= max_terms:
+            break
+    if not out:
+        return ""
+    return " OR ".join(f"{t}*" for t in out)
+    
 def _canon_path(p: str | os.PathLike[str]) -> str:
     try:
         return str(Path(p).resolve())
@@ -278,27 +306,29 @@ class GlyphDB:
 
     def resolve_unlinked_calls(self) -> int:
         """
-        Link calls where dst_gid is NULL by unique name match.
-        Returns number of rows updated.
+        Link calls where (dst_gid IS NULL) and a UNIQUE function definition by name exists.
+        Prototypes are ignored; ambiguity keeps call unresolved.
         """
-        # Build name→gid map for unique names
-        names = self.conn.execute(
-            "SELECT name, COUNT(*) AS c FROM entities GROUP BY name HAVING c=1"
-        ).fetchall()
-        if not names:
-            return 0
-        params = {r["name"]: self.conn.execute(
-            "SELECT gid FROM entities WHERE name=? LIMIT 1", (r["name"],)
-        ).fetchone()["gid"] for r in names}
-        total = 0
-        with self.tx():
-            for nm, gid in params.items():
-                cur = self.conn.execute(
-                    "UPDATE calls SET dst_gid=? WHERE dst_gid IS NULL AND dst_name=?",
-                    (gid, nm),
-                )
-                total += cur.rowcount or 0
-        return total
+        sql = """
+        WITH defs AS (
+          SELECT name, gid
+          FROM entities
+          WHERE kind='fn'
+        ),
+        uniq AS (
+          SELECT name, gid
+          FROM defs
+          GROUP BY name
+          HAVING COUNT(*) = 1
+        )
+        UPDATE calls
+        SET dst_gid = (SELECT uniq.gid FROM uniq WHERE uniq.name = calls.dst_name)
+        WHERE dst_gid IS NULL
+          AND EXISTS (SELECT 1 FROM uniq WHERE uniq.name = calls.dst_name)
+        """
+        cur = self.conn.execute(sql)
+        self.conn.commit()
+        return cur.rowcount or 0
 
     # ----- fetch / lookup -----
 
@@ -368,16 +398,30 @@ class GlyphDB:
             for r in cur
         ]
 
-    def fts_search(self, query: str, limit: int = 50) -> list[tuple[str, str, str]]:
+    def fts_search(self, query: str, *, limit: int = 50) -> list[tuple[str, str, str]]:
         """
         FTS query over name/decl_sig/eff_sig.
-        Returns list of (gid, name, decl_sig).
+        Returns list of (gid, name, decl_sig). Robust to NL queries.
         """
-        cur = self.conn.execute(
-            "SELECT gid, name, decl_sig FROM entities_fts WHERE entities_fts MATCH ? LIMIT ?",
-            (query, int(limit)),
-        )
-        return [(r["gid"], r["name"], r["decl_sig"]) for r in cur]
+        expr = _fts_expr_from_text(query)
+        if not expr:
+            return []
+        try:
+            cur = self.conn.execute(
+                "SELECT gid, name, decl_sig FROM entities_fts "
+                "WHERE entities_fts MATCH ? LIMIT ?",
+                (expr, int(limit)),
+            )
+            return [(r["gid"], r["name"], r["decl_sig"]) for r in cur]
+        except sqlite3.OperationalError:
+            # very conservative fallback
+            like = f"%{query.strip()}%"
+            cur = self.conn.execute(
+                "SELECT gid, name, decl_sig FROM entities "
+                "WHERE name LIKE ? OR decl_sig LIKE ? LIMIT ?",
+                (like, like, int(limit)),
+            )
+            return [(r["gid"], r["name"], r["decl_sig"]) for r in cur]
 
     def lookup_span(self, file_path: str | os.PathLike[str], offset: int) -> Optional[DbEntity]:
         p = _canon_path(file_path)

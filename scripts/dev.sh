@@ -206,3 +206,5 @@ glyph --version || { echo "ERR: console script not found"; exit 1; }
 echo "✔ Dev env ready. Activate with:  source .venv/bin/activate"
 echo "✔ Try: glyph --version"
 [[ $REBUILD -eq 1 ]] && echo "Rebuild complete."
+
+chmod u+x ./scripts/*
