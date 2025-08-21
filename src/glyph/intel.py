@@ -12,8 +12,22 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .db import GlyphDB, DbEntity
 
+# ----------------------- tiny logger -----------------------
+_VERBOSE = os.environ.get("GLYPH_INTEL_VERBOSE", "0") not in ("", "0", "false", "False")
 
-# ----------------------- Context dataclass -----------------------
+def _log(kind: str, payload) -> None:
+    if not _VERBOSE:
+        return
+    try:
+        if isinstance(payload, str):
+            sys.stderr.write(f"[intel] {kind}: {payload}\n")
+        else:
+            sys.stderr.write(f"[intel] {kind}: {json.dumps(payload, ensure_ascii=False)[:10000]}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+# ----------------------- data models -----------------------
 
 @dataclass(frozen=True)
 class ContextItem:
@@ -27,48 +41,35 @@ class ContextItem:
     end: int
     snippet: str
 
-
-# ----------------------- Small utilities -----------------------
+# ----------------------- helpers -----------------------
 
 _IDENT_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-def _is_ident(token: str) -> bool:
-    return _IDENT_RX.fullmatch(token) is not None
-
-def _extract_identifiers(q: str) -> List[str]:
-    """
-    Pull out identifier-ish tokens from a natural-language question.
-    Prefer tokens with '_' or length >= 4 to avoid noise.
-    Deduplicate while preserving order.
-    """
+def _idents_in_text(text: str) -> List[str]:
+    # keep order, dedupe
     seen: set[str] = set()
     out: List[str] = []
-    for tok in _IDENT_RX.findall(q):
-        if "_" in tok or len(tok) >= 4:
-            if tok not in seen:
-                seen.add(tok)
-                out.append(tok)
+    for m in _IDENT_RX.finditer(text):
+        tok = m.group(0)
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
     return out
 
 def _read_span(path: str, start: int, end: int, *, surround_lines: int = 2) -> str:
-    """
-    Safely extract a line-rounded snippet for [start,end) byte offsets.
-    If offsets are out-of-sync, fall back to the whole file.
-    """
     try:
         b = Path(path).read_bytes()
-        s = max(0, min(start, len(b)))
-        e = max(s, min(end, len(b)))
-        full_txt = b.decode("utf-8", "ignore")
-        # Convert byte offsets to line numbers by counting newlines before s and e
-        # (approximate; good enough for readable context)
-        pre = full_txt[:s]
-        seg = full_txt[s:e]
-        start_ln = pre.count("\n")
-        end_ln = start_ln + seg.count("\n")
-        lines = full_txt.splitlines()
-        lo = max(0, start_ln - surround_lines)
-        hi = min(len(lines), end_ln + 1 + surround_lines)
+        start = max(0, min(start, len(b)))
+        end = max(start, min(end, len(b)))
+        view = b[start:end]
+        txt = view.decode("utf-8", "ignore")
+
+        full = b.decode("utf-8", "ignore")
+        before = full[:start].count("\n")
+        after = before + txt.count("\n")
+        lines = full.splitlines()
+        lo = max(0, before - surround_lines)
+        hi = min(len(lines), after + 1 + surround_lines)
         return "\n".join(lines[lo:hi])
     except Exception:
         try:
@@ -76,11 +77,10 @@ def _read_span(path: str, start: int, end: int, *, surround_lines: int = 2) -> s
         except Exception:
             return ""
 
-
-# ----------------------- Retriever -----------------------
+# ----------------------- retrieval -----------------------
 
 class GlyphRetriever:
-    """Retrieval over GlyphDB (identifier-first, FTS fallback, neighbor expansion)."""
+    """Thin retrieval layer over GlyphDB (exact-name seeds + FTS + neighbor expansion)."""
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -90,49 +90,37 @@ class GlyphRetriever:
         self.db.close()
 
     def search(self, q: str, *, limit: int = 8) -> List[DbEntity]:
-        """
-        Strategy:
-          1) For each identifier token in the question:
-               - exact name lookup
-               - then FTS for that single token
-          2) Broad FTS on the whole question
-        """
         out: List[DbEntity] = []
         seen: set[str] = set()
 
-        def add(ent: Optional[DbEntity]) -> bool:
-            if not ent:
-                return False
-            if ent.gid in seen:
-                return False
-            out.append(ent)
-            seen.add(ent.gid)
-            return len(out) >= limit
-
-        # 1) Identifier-focused passes
-        for tok in _extract_identifiers(q):
-            for ent in self.db.lookup_by_name(tok):
-                if add(ent):
-                    return out
-            for gid, name, decl in self.db.fts_search(tok, limit=max(3, limit // 2)):
-                if gid in seen:
+        # 1) extract identifiers from the question and do exact lookups first
+        idents = _idents_in_text(q)
+        _log("idents_from_question", idents)
+        for ident in idents:
+            for ent in self.db.lookup_by_name(ident):
+                if ent.gid in seen:
                     continue
-                ent = self.db.get_entity(gid)
-                if add(ent):
+                out.append(ent)
+                seen.add(ent.gid)
+                if len(out) >= limit:
+                    _log("seeds", [e.name for e in out])
                     return out
 
-        # 2) Broad FTS
+        # 2) FTS fallback (db.fts_search already quotes/escapes)
         for gid, name, decl in self.db.fts_search(q, limit=limit):
             if gid in seen:
                 continue
             ent = self.db.get_entity(gid)
-            if add(ent):
-                break
+            if ent:
+                out.append(ent)
+                seen.add(gid)
+                if len(out) >= limit:
+                    break
 
+        _log("seeds", [e.name for e in out])
         return out
 
     def expand_neighbors(self, seeds: Sequence[DbEntity], *, hops: int = 1, per_hop: int = 4) -> List[DbEntity]:
-        """Add callers/callees around seeds (breadth-limited)."""
         out: List[DbEntity] = list(seeds)
         seen: set[str] = {e.gid for e in seeds}
         frontier: List[str] = [e.gid for e in seeds]
@@ -140,7 +128,7 @@ class GlyphRetriever:
             nxt: List[str] = []
             for gid in frontier:
                 # callees
-                for dg, _dn in self.db.callees(gid)[:per_hop]:
+                for dg, dn in self.db.callees(gid)[:per_hop]:
                     if not dg or dg in seen:
                         continue
                     ent = self.db.get_entity(dg)
@@ -160,20 +148,14 @@ class GlyphRetriever:
             frontier = nxt
             if not frontier:
                 break
+        _log("expanded_neighbors", [e.name for e in out])
         return out
 
-    def materialize(
-        self,
-        ents: Sequence[DbEntity],
-        *,
-        surround_lines: int = 2,
-        max_chars: int = 14_000,
-    ) -> List[ContextItem]:
+    def materialize(self, ents: Sequence[DbEntity], *, surround_lines: int = 2, max_chars: int = 14000) -> List[ContextItem]:
         ctx: List[ContextItem] = []
         total = 0
         for e in ents:
             snip = _read_span(e.file_path, e.start, e.end, surround_lines=surround_lines)
-            # enforce budget gently
             if max_chars > 0 and total + len(snip) > max_chars:
                 snip = snip[: max(0, max_chars - total)]
             ctx.append(
@@ -192,21 +174,15 @@ class GlyphRetriever:
             total += len(snip)
             if max_chars > 0 and total >= max_chars:
                 break
+        _log("materialized", [{"name": c.name, "bytes": len(c.snippet)} for c in ctx])
         return ctx
-
 
 # ----------------------- Ollama client -----------------------
 
-def _http_alive(endpoint: str) -> bool:
-    """
-    Quick probe: GET /api/tags (Ollama provides this). Timeout ~1s.
-    """
+def _ollama_http_available(endpoint: str) -> bool:
     try:
-        import urllib.request
-        url = endpoint.rstrip("/") + "/api/tags"
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=1) as resp:  # noqa: S310
-            return resp.status == 200
+        import urllib.request  # noqa: F401
+        return True
     except Exception:
         return False
 
@@ -218,12 +194,11 @@ def _ollama_generate_http(prompt: str, *, model: str, endpoint: str) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310
+    with urllib.request.urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read().decode("utf-8", "ignore"))
         return data.get("response", "").strip()
 
 def _ollama_generate_cli(prompt: str, *, model: str) -> str:
-    # `ollama run MODEL` reads prompt from stdin
     p = subprocess.run(
         ["ollama", "run", model],
         input=prompt,
@@ -235,36 +210,46 @@ def _ollama_generate_cli(prompt: str, *, model: str) -> str:
     return p.stdout.strip() or p.stderr.strip()
 
 def call_ollama(prompt: str, *, model: str = "gpt-oss:20b", endpoint: str = "http://localhost:11434") -> str:
-    if _http_alive(endpoint):
+    _log("prompt_preview", prompt[:1200])
+    if _ollama_http_available(endpoint):
         try:
-            return _ollama_generate_http(prompt, model=model, endpoint=endpoint)
-        except Exception:
-            pass
-    return _ollama_generate_cli(prompt, model=model)
+            out = _ollama_generate_http(prompt, model=model, endpoint=endpoint)
+            _log("model_output_preview", out[:1200])
+            return out
+        except Exception as e:
+            _log("ollama_http_error", repr(e))
+    out = _ollama_generate_cli(prompt, model=model)
+    _log("model_output_preview", out[:1200])
+    return out
 
-
-# ----------------------- Prompting -----------------------
-
-_SYSTEM = (
-    "You are an expert C/C++ code analyst. Answer ONLY from the provided code snippets.\n"
-    "If something isn't present in the snippets, say you don't know.\n"
-    "When a function returns a simple expression (e.g., `return a+b;`), include that exact expression "
-    "verbatim in backticks (e.g., `a+b`). Be concise.\n"
-)
+# ----------------------- Prompting & Orchestration -----------------------
 
 def _build_prompt(question: str, ctx: Sequence[ContextItem]) -> str:
+    q_idents = _idents_in_text(question)
+    primary = q_idents[0] if q_idents else None
+
+    rules = [
+        "You are an expert C/C++ code analyst.",
+        "Answer ONLY using the provided context snippets. If unknown, say so briefly.",
+        "Cite snippet indices like [#1], [#2] when referring to code.",
+        "Be concise (1–2 sentences).",
+        "Explicitly describe the core operation in code terms if visible (e.g., 'returns a + b').",
+    ]
+    if primary:
+        rules.append(f"Your FIRST LINE MUST start with '{primary}: ' and include that exact identifier.")
+    else:
+        rules.append("Your FIRST LINE MUST start with the primary identifier you are describing, followed by ': '.")
+
     parts: List[str] = []
-    parts.append(_SYSTEM)
+    parts.append("\n".join(rules))
     parts.append("\nContext:")
     for i, c in enumerate(ctx, 1):
         header = f"[#{i}] {c.kind} {c.storage} {c.name} — {c.decl_sig}\nfile://{c.file_path}  bytes:{c.start}-{c.end}"
-        parts.append(f"{header}\n```c\n{c.snippet}\n```\n")
+        fence = "```c"
+        parts.append(f"{header}\n{fence}\n{c.snippet}\n```\n")
     parts.append(f"User question: {question}\n")
-    parts.append("Answer in one short sentence. If applicable, include the exact return expression in backticks.")
+    parts.append("Answer:")
     return "\n".join(parts)
-
-
-# ----------------------- Orchestration -----------------------
 
 def answer_question(
     db_path: str,
@@ -274,15 +259,12 @@ def answer_question(
     hops: int = 1,
     model: str = "gpt-oss:20b",
     endpoint: str = "http://localhost:11434",
-    max_chars: int = 14_000,
+    max_chars: int = 14000,
 ) -> str:
     retr = GlyphRetriever(db_path)
     try:
-        # Seed & expand
         seeds = retr.search(question, limit=k)
         expanded = retr.expand_neighbors(seeds, hops=hops, per_hop=max(2, k // 2))
-
-        # De-dup by gid, preserve order
         seen: set[str] = set()
         uniq: List[DbEntity] = []
         for e in seeds + expanded:
@@ -290,15 +272,7 @@ def answer_question(
                 continue
             seen.add(e.gid)
             uniq.append(e)
-
-        # Materialize code context
         ctx = retr.materialize(uniq, surround_lines=2, max_chars=max_chars)
-
-        # If somehow empty, return a clear message (helps tests)
-        if not ctx:
-            return "I couldn't find relevant code in the database for this question."
-
-        # Prompt and ask
         prompt = _build_prompt(question, ctx)
         return call_ollama(prompt, model=model, endpoint=endpoint)
     finally:
