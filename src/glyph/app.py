@@ -1,23 +1,40 @@
 # src/glyph/app.py
 from __future__ import annotations
-import sys, shlex
+
+import shlex
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
+
 import typer
 
 from . import __version__
+from .io import (
+    configure,
+    ensure_stdout_is_json_only,
+    emit_info,
+    emit_warn,
+    emit_err,
+    emit_json,
+    heading,
+)
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="GLYPH — readable C marker & analysis")
 dbv = typer.Typer(help="DB ops: init, ingest, show, callers/callees, search, resolve, vacuum")
 ai = typer.Typer(help="LLM-assisted queries over a Glyph DB (Ollama-backed)")
 plan = typer.Typer(help="Repo-aware planning: explain, propose, impact, status")
+git = typer.Typer(help="Git integration: plan/apply/snapshot")
+
 app.add_typer(dbv, name="dbv")
 app.add_typer(dbv, name="db")  # alias
 app.add_typer(ai, name="ai")
 app.add_typer(plan, name="plan")
+app.add_typer(git, name="git")
 
 
-# ------------- helpers ----------------
+# ──────────────────────────────────────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _read_text(p: str) -> str:
     return sys.stdin.read() if p == "-" else Path(p).read_text(encoding="utf-8", errors="ignore")
@@ -43,10 +60,13 @@ def _parse_items(specs: List[str]) -> List[Tuple[str, str, str]]:
         items.append((name, path, _read_text(path)))
     return items
 
-# ------------- global options -------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# global options / entrypoint
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _cli_version() -> str:
-    import subprocess, sys
+    import subprocess
     attempts = (
         ["glyph", "--version"],
         [sys.executable, "-m", "glyph", "--version"],
@@ -57,13 +77,11 @@ def _cli_version() -> str:
             r = subprocess.run(cmd, text=True, capture_output=True, check=True)
             out = (r.stdout or r.stderr).strip()
             if out:
-                return out  # e.g., "glyph 0.0.1"
+                return out
         except Exception as e:
             last_err = e
-    # Fallback to package version so doctor still passes in dev envs
     try:
-        from . import __version__ as _ver
-        return f"glyph {_ver}"
+        return f"glyph {__version__}"
     except Exception:
         raise RuntimeError(f"cannot execute glyph CLI: {last_err!r}")
 
@@ -75,18 +93,31 @@ def _version_cb(value: bool):
 @app.callback(invoke_without_command=True)
 def _entrypoint(
     version: bool = typer.Option(
-        False,
-        "--version",
-        "-V",
-        help="Show version and exit",
-        callback=_version_cb,
-        is_eager=True,
-    )
+        False, "--version", "-V", help="Show version and exit", callback=_version_cb, is_eager=True
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON on stdout; human messages go to stderr"),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="-v (verbose), -vv (trace)"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Silence non-error human output"),
+    color: str = typer.Option("auto", "--color", help="Color output: auto|always|never"),
+    timestamps: bool = typer.Option(False, "--timestamps", help="Prefix human messages with HH:MM:SS"),
+    log_path: Optional[str] = typer.Option(None, "--log", help="Append human output to a log file"),
 ):
-    # no-op; we only use this to host global options like --version
+    # Configure global IO behavior
+    if quiet:
+        v = "quiet"
+    else:
+        v = "trace" if verbose >= 2 else ("verbose" if verbose == 1 else "normal")
+    configure(
+        verbosity=v, color=color, json_mode=json_out, timestamps=timestamps, log_path=log_path
+    )
+    ensure_stdout_is_json_only()
+    # no-op return; subcommands execute next
     return
-    
-# ------------- core commands -------------
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# core commands
+# ──────────────────────────────────────────────────────────────────────────────
 
 @app.command(help="Rewrite a snippet/file with GLYPH markers")
 def rewrite(
@@ -95,7 +126,9 @@ def rewrite(
     cflags: str = typer.Option("", "--cflags", help="Compiler flags, e.g. '-Iinclude -DHAVE_X=1'"),
 ):
     from .rewriter import rewrite_snippet
+    heading("Rewriting")  # human-only
     res = rewrite_snippet(_read_text(file), filename=name, extra_args=shlex.split(cflags))
+    # final payload is the code → stdout
     typer.echo(res.code, nl=False)
 
 @app.command(help="Emit compact JSONL pack for LLMs")
@@ -106,6 +139,7 @@ def pack(
 ):
     from .llm_pack import pack_snippets
     snippets = _parse_files(files) if files else {name: sys.stdin.read()}
+    heading("Packing snippets")
     out = pack_snippets(snippets, extra_args=shlex.split(cflags))
     typer.echo(out.to_str(), nl=False)
 
@@ -117,8 +151,10 @@ def tree(
 ):
     from .tree_agent import build_units, infer_summary
     snippets = _parse_files(files) if files else {name: sys.stdin.read()}
+    heading("Building units")
     units = build_units(snippets, extra_args=shlex.split(cflags))
     summary = infer_summary(units)
+    # JSON to stdout
     typer.echo(summary.to_json(indent=2))
 
 @app.command(help="Print caller→callee edges for a snippet/file")
@@ -134,7 +170,10 @@ def deps(
             nm = cg.names.get(dst, "")
             typer.echo(f"{src} -> {dst}" + (f"  # {nm}" if nm else ""))
 
-# ------------- dbv subcommands -------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# dbv subcommands
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dbv.command("init")
 def dbv_init(
@@ -144,6 +183,7 @@ def dbv_init(
     from .db import GlyphDB
     with GlyphDB(db) as _:
         pass
+    # stdout so scripts can capture path
     typer.echo(db)
 
 @dbv.command("ingest")
@@ -177,18 +217,18 @@ def dbv_ingest(
 
     with GlyphDB(db) as gdb:
         for name, path, code in items:
+            emit_info(f"ingest: {path}")
             res = rewrite_snippet(code, filename=name, extra_args=shlex.split(cflags))
             ents = list(res.entities)
 
-            # Only resolve to real function definitions
-            name2gid_defs: dict[str, str] = {e.name: e.gid for e in ents if e.kind == "fn"}
+            name2gid_defs: Dict[str, str] = {e.name: e.gid for e in ents if e.kind == "fn"}
             fn_ents: List[REntity] = [e for e in ents if e.kind == "fn"]
 
             cg = callgraph_snippet(code, filename=name, extra_args=shlex.split(cflags))
-            edges: List[Tuple[str, str | None, str | None]] = []
-            added: dict[str, set[str]] = {}
+            edges: List[Tuple[str, Optional[str], Optional[str]]] = []
+            added: Dict[str, set[str]] = {}
 
-            # AST-derived edges: src must be a local definition; dst resolves only to defs
+            # AST-derived edges (src must be local definition; dst→defs if known)
             for src in cg.roots:
                 src_name = cg.names.get(src)
                 src_gid = name2gid_defs.get(src_name)
@@ -205,16 +245,17 @@ def dbv_ingest(
                 if dsts:
                     added[src_gid] = dsts
 
-            # Fallback textual scan: same policy (defs only)
+            # Fallback textual scan
             fb = _fallback_calls(code, fn_ents)
             for src_gid, names in fb.items():
                 already = added.get(src_gid, set())
                 for dst_name in names - already:
-                    dst_gid = name2gid_defs.get(dst_name)  # defs only
+                    dst_gid = name2gid_defs.get(dst_name)
                     edges.append((src_gid, dst_gid, dst_name))
 
             gdb.ingest_file(file_path=path, entities=ents, calls=edges, file_bytes=code.encode("utf-8"))
 
+    # stdout sentinel
     typer.echo("ok")
 
 @dbv.command("show")
@@ -226,7 +267,9 @@ def dbv_show(
     with GlyphDB(db) as gdb:
         ent = gdb.get_entity(gid)
         if not ent:
+            emit_err(f"unknown gid: {gid}")
             raise typer.Exit(code=1)
+        # stdout (used by tests/grep)
         typer.echo(f"{ent.gid}\t{ent.kind}\t{ent.storage}\t{ent.name}\t{ent.decl_sig or ent.name}")
         typer.echo(f"{ent.file_path}:{ent.start}-{ent.end}")
         if ent.eff_sig:
@@ -279,15 +322,18 @@ def dbv_search(
             if len(printed) >= limit:
                 break
 
-# ------------- repo scanner (Make-aware) -------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# repo scanner (Make-aware)
+# ──────────────────────────────────────────────────────────────────────────────
 
 @app.command(help="Scan a repo, optionally via make -nB, rewrite, and ingest DB")
 def scan(
     root: str = typer.Option(".", "--root"),
     db: str = typer.Option(".glyph/idx.sqlite", "--db"),
-    mirror: str | None = typer.Option(None, "--mirror", help="Mirror rewritten files to dir"),
-    make: str | None = typer.Option(None, "--make", help="e.g. 'make -nB all' to harvest flags"),
-    target: str | None = typer.Option(None, "--target", help="make target when using --make"),
+    mirror: Optional[str] = typer.Option(None, "--mirror", help="Mirror rewritten files to dir"),
+    make: Optional[str] = typer.Option(None, "--make", help="e.g. 'make -nB all' to harvest flags"),
+    target: Optional[str] = typer.Option(None, "--target", help="make target when using --make"),
     ext: str = typer.Option(".c,.h,.cc,.cpp,.cxx", "--ext"),
     ignore: str = typer.Option(".git,.glyph,build", "--ignore"),
     cflags: str = typer.Option("", "--cflags", help="Fallback flags when none harvested"),
@@ -306,8 +352,10 @@ def scan(
 
     files: List[Path] = []
     for p in rootp.rglob("*"):
-        if not p.is_file(): continue
-        if any(part in ig for part in p.parts): continue
+        if not p.is_file():
+            continue
+        if any(part in ig for part in p.parts):
+            continue
         if p.suffix.lower() in exts:
             files.append(p)
 
@@ -325,8 +373,13 @@ def scan(
                 outp = Path(mirror) / fp.relative_to(rootp)
                 outp.parent.mkdir(parents=True, exist_ok=True)
                 outp.write_text(res.code, encoding="utf-8")
+            emit_info(f"scanned: {fp}")
 
-# ------------- db maintenance -------------
+    typer.echo("ok")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# db maintenance
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dbv.command("resolve")
 def dbv_resolve(
@@ -335,6 +388,7 @@ def dbv_resolve(
     from .db import GlyphDB
     with GlyphDB(db) as gdb:
         n = gdb.resolve_unlinked_calls()
+        # stdout numeric sentinel (scripts ignore/capture)
         typer.echo(str(n))
 
 @dbv.command("vacuum")
@@ -344,7 +398,7 @@ def dbv_vacuum(
     from .db import GlyphDB
     with GlyphDB(db) as gdb:
         gdb.vacuum()
-        typer.echo("ok")
+    typer.echo("ok")
 
 @dbv.command("analyze")
 def dbv_analyze(
@@ -353,29 +407,30 @@ def dbv_analyze(
     from .db import GlyphDB
     with GlyphDB(db) as gdb:
         gdb.analyze()
-        typer.echo("ok")
+    typer.echo("ok")
 
-# ------------- git integration -------------
 
-git = typer.Typer(help="Git integration: plan/apply/snapshot")
-app.add_typer(git, name="git")
+# ──────────────────────────────────────────────────────────────────────────────
+# git integration
+# ──────────────────────────────────────────────────────────────────────────────
 
 @git.command("plan", help="Create/switch to branch, install hooks, init DB")
 def git_plan(
     branch: str = typer.Option(..., "--branch"),
-    base: str | None = typer.Option(None, "--base"),
+    base: Optional[str] = typer.Option(None, "--base"),
     strict: bool = typer.Option(False, "--strict"),
     db: str = typer.Option(".glyph/idx.sqlite", "--db"),
     mirror: str = typer.Option(".glyph/mirror", "--mirror"),
-    make: str | None = typer.Option(None, "--make"),
-    cflags: str | None = typer.Option(None, "--cflags"),
+    make: Optional[str] = typer.Option(None, "--make"),
+    cflags: Optional[str] = typer.Option(None, "--cflags"),
     root: str = typer.Option(".", "--root"),
 ):
     from .gitvc import plan_branch
     res = plan_branch(root, branch, base, db_path=db, mirror_dir=mirror,
                       make_cmd=make, cflags=cflags, strict_hooks=strict)
-    # minimal, deterministic output
-    typer.echo(f"branch: {res.branch}\npre-commit: {res.pre_commit}\npost-merge: {res.post_merge}\nDB: {res.db_path}\nmirror: {res.mirror_dir}")
+    typer.echo(
+        f"branch: {res.branch}\npre-commit: {res.pre_commit}\npost-merge: {res.post_merge}\nDB: {res.db_path}\nmirror: {res.mirror_dir}"
+    )
 
 @git.command("snapshot", help="Create/replace annotated tag for current DB state")
 def git_snapshot(
@@ -385,7 +440,7 @@ def git_snapshot(
 ):
     from .gitvc import tag_db_snapshot
     tag = tag_db_snapshot(root, db, prefix=prefix)
-    typer.echo(tag, nl=False)  # no trailing newline
+    typer.echo(tag, nl=False)
 
 @git.command("apply", help="Stage .glyph, commit allow-empty, tag snapshot; prints tag")
 def git_apply(
@@ -397,17 +452,21 @@ def git_apply(
 ):
     from .gitvc import apply_snapshot
     tag = apply_snapshot(root, db_path=db, mirror_dir=mirror, message=message, tag_prefix=prefix)
-    typer.echo(tag, nl=False)  # no trailing newline
+    typer.echo(tag, nl=False)
 
 @git.command("push", help="Push branch and tags to remote")
 def git_push(
     remote: str = typer.Option("origin", "--remote"),
-    branch: str | None = typer.Option(None, "--branch"),
+    branch: Optional[str] = typer.Option(None, "--branch"),
     root: str = typer.Option(".", "--root"),
 ):
     from .gitvc import push_with_tags
     push_with_tags(root, remote=remote, branch=branch)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# doctor / summary
+# ──────────────────────────────────────────────────────────────────────────────
 
 @app.command(help="Check glyph health: env, libclang, sqlite FTS5, bundled tests")
 def doctor(
@@ -417,12 +476,11 @@ def doctor(
     code = _run_doctor(verbose=verbose)
     raise typer.Exit(code)
 
-
 @app.command(help="Scour a codebase and emit a full summary (files, entities, calls)")
 def summary(
     root: str = typer.Option(".", "--root"),
-    make: str | None = typer.Option(None, "--make", help="e.g. 'make -nB all' to harvest per-file flags"),
-    target: str | None = typer.Option(None, "--target", help="make target for --make"),
+    make: Optional[str] = typer.Option(None, "--make", help="e.g. 'make -nB all' to harvest per-file flags"),
+    target: Optional[str] = typer.Option(None, "--target", help="make target for --make"),
     cflags: str = typer.Option("", "--cflags", help="Fallback compiler flags"),
     ext: str = typer.Option(".c,.h,.cc,.cpp,.cxx,.hpp,.hh,.hxx", "--ext"),
     ignore: str = typer.Option(".git,.glyph,build", "--ignore"),
@@ -439,6 +497,10 @@ def summary(
     )
     typer.echo(res.to_json(indent=2 if pretty else 0), nl=True)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AI / plan
+# ──────────────────────────────────────────────────────────────────────────────
 
 @ai.command("ask")
 def ai_ask(
@@ -465,13 +527,12 @@ def plan_explain(
     import json as _json
     from .plan import explain as plan_explain_basic
 
-    metrics = plan_explain_basic(db)  # dict: {files, entities_by_kind, unresolved_calls}
-
+    metrics = plan_explain_basic(db)
     if json_out:
-        typer.echo(_json.dumps(metrics, indent=2))
+        emit_json(metrics)
         return
 
-    # Minimal markdown view (deterministic)
+    # human markdown → stdout (readable)
     ents = ", ".join(f"{k}:{v}" for k, v in sorted(metrics.get("entities_by_kind", {}).items()))
     md = [
         "# Repo summary",
@@ -482,7 +543,6 @@ def plan_explain(
     typer.echo("\n".join(md))
 
     if ai:
-        # Inline AI summary using ollama via intel.call_ollama
         try:
             from .intel import call_ollama
             prompt = (
@@ -495,8 +555,7 @@ def plan_explain(
             typer.echo("\n--- AI summary ---\n")
             typer.echo(call_ollama(prompt, model=model, endpoint=endpoint).strip())
         except Exception as e:
-            typer.echo(f"\n--- AI summary (unavailable) ---\n{e}", err=True)
-
+            emit_warn(f"AI summary unavailable: {e}")
 
 @plan.command("propose", help="Draft a repo-aware plan; schema-first (AI optional)")
 def plan_propose(
@@ -511,10 +570,9 @@ def plan_propose(
     verbose: bool = typer.Option(False, "--verbose"),
     md: bool = typer.Option(False, "--md", help="Also render markdown-ish view"),
 ):
-    import json as _json
     from .plan import propose as plan_propose_fn
 
-    plan = plan_propose_fn(
+    plan_obj = plan_propose_fn(
         db_path=db,
         goals_text=goals,
         resources_text=resources,
@@ -524,25 +582,24 @@ def plan_propose(
         fallback_after=fallback_after,
         fallback_threshold=fallback_threshold,
     )
-    typer.echo(_json.dumps(plan, indent=2))
+    emit_json(plan_obj)
 
     if md:
-        # lightweight markdown rendering
+        # optional human rendering to stdout
         lines = ["# Proposed plan"]
-        if plan.get("goals"):
+        if plan_obj.get("goals"):
             lines.append("## Goals")
-            lines += [f"- {g}" for g in plan["goals"]]
-        if plan.get("steps"):
+            lines += [f"- {g}" for g in plan_obj["goals"]]
+        if plan_obj.get("steps"):
             lines.append("## Steps")
-            for s in plan["steps"]:
+            for s in plan_obj["steps"]:
                 deps = f" (deps: {', '.join(s.get('deps', []))})" if s.get("deps") else ""
                 lines.append(f"- **{s.get('id','?')}**: {s.get('title','')} {deps}")
-        if plan.get("risks"):
+        if plan_obj.get("risks"):
             lines.append("## Risks")
-            for r in plan["risks"]:
+            for r in plan_obj["risks"]:
                 lines.append(f"- {r.get('risk','')} — _mitigation_: {r.get('mitigation','')}")
         typer.echo("\n".join(lines))
-
 
 @plan.command("impact", help="Show callers/callees blast radius for a symbol")
 def plan_impact(
@@ -551,19 +608,17 @@ def plan_impact(
     json_out: bool = typer.Option(False, "--json"),
     verbose: bool = typer.Option(False, "--verbose"),
 ):
-    import json as _json
     from .plan import impact as plan_impact_fn
 
     if not symbol:
-        typer.echo("error: --symbol is required", err=True)
+        emit_err("error: --symbol is required")
         raise typer.Exit(2)
 
     try:
         rep = plan_impact_fn(db, symbol)
         if json_out:
-            typer.echo(_json.dumps(rep, indent=2))
+            emit_json(rep)
         else:
-            # simple text view
             lines = [f"target: {rep.get('target')}"]
             lines.append(f"entities: {', '.join(rep.get('entities', [])) or '(none)'}")
             lines.append("callers:")
@@ -575,19 +630,16 @@ def plan_impact(
                 lines.append("  (none)")
             typer.echo("\n".join(lines))
     except Exception as e:
-        # deterministic JSON error payload (our tests may rely on JSON)
         out = {"target": symbol, "entities": [], "callers": {}, "by_name": {}, "error": str(e)}
         if verbose:
-            typer.echo(f"[impact:error] {e}", err=True)
-        typer.echo(_json.dumps(out))
-
+            emit_warn(f"[impact:error] {e}")
+        emit_json(out)
 
 @plan.command("status", help="Evaluate a plan.json against current repo signals")
 def plan_status(
     db: str = typer.Option(".glyph/idx.sqlite", "--db"),
     plan_json: str = typer.Option(..., "--plan", help="Path to plan.json"),
 ):
-    import json as _json
     from .plan import status as plan_status_fn
     out = plan_status_fn(db, plan_json)
-    typer.echo(_json.dumps(out, indent=2))
+    emit_json(out)
