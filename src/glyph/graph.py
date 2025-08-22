@@ -8,7 +8,8 @@ _ensure_libclang()
 from clang import cindex
 
 # Reuse the same helpers as the rewriter to keep IDs consistent.
-from .rewriter import _effsig as _effsig_fn, _storage_of as _storage_of_fn, _short_id  # internal, deliberate import
+from .rewriter import _effsig as _effsig_fn, _storage_of as _storage_of_fn  # internal, deliberate import
+from .ids import short_id
 
 def _clang_args_for(filename: str, extra: Iterable[str] | None) -> list[str]:
     args = ["-x", "c"]
@@ -28,16 +29,16 @@ def _fn_id(cur: cindex.Cursor, filename: str) -> str:
     eff = _effsig_fn(cur)
     storage = _storage_of_fn(cur)
     kind = "fn" if cur.is_definition() else "proto"
-    return _short_id(kind, eff, storage, filename)
+    return short_id(kind, eff, storage, filename)
 
 def _callee_id(ref: cindex.Cursor, fallback_name: str, filename: str) -> str:
     if ref is None:
         # Unknown/builtin; keep stable by hashing name + filename.
-        return _short_id("callee", fallback_name, "extern", filename)
+        return short_id("callee", fallback_name, "extern", filename)
     eff = _effsig_fn(ref)
     storage = _storage_of_fn(ref) if hasattr(ref, "storage_class") else "extern"
     fn = ref.location.file.name if ref.location and ref.location.file else filename
-    return _short_id("fn", eff, storage, fn)
+    return short_id("fn", eff, storage, fn)
 
 def callgraph_snippet(code: str, *, filename: str = "snippet.c", extra_args: Iterable[str] | None = None) -> CallGraph:
     """

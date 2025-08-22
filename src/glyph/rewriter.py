@@ -6,37 +6,10 @@ from .libclang_loader import ensure as _ensure_libclang
 _ensure_libclang()
 
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple
 from clang import cindex
+from .ids import short_id
+from typing import Optional, Iterable, List, Tuple
 
-# ── ID generation (CRC64-ECMA + base36, short & stable) ──────────────────────
-_POLY = 0x42F0E1EBA9EA3693
-_TABLE = [0] * 256
-for i in range(256):
-    c = i << 56
-    for _ in range(8):
-        c = (c << 1) ^ _POLY if (c & (1 << 63)) else (c << 1)
-    _TABLE[i] = c & 0xFFFFFFFFFFFFFFFF
-
-def _crc64(data: bytes) -> int:
-    crc = 0
-    for b in data:
-        crc = _TABLE[((crc >> 56) ^ b) & 0xFF] ^ ((crc << 8) & 0xFFFFFFFFFFFFFFFF)
-    return crc & 0xFFFFFFFFFFFFFFFF
-
-_A36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-def _b36(n: int) -> str:
-    if n == 0:
-        return "0"
-    s = []
-    while n:
-        n, r = divmod(n, 36)
-        s.append(_A36[r])
-    return "".join(reversed(s))
-
-def _short_id(*parts: str) -> str:
-    seed = "|".join(parts).encode("utf-8")
-    return _b36(_crc64(seed))[:10]
 
 # ── clang glue ────────────────────────────────────────────────────────────────
 def _clang_args_for(filename: str, extra: Iterable[str] | None) -> List[str]:
@@ -52,13 +25,71 @@ def _clang_args_for(filename: str, extra: Iterable[str] | None) -> List[str]:
 class Entity:
     kind: str          # fn | prototype | typedef | struct | union | enum | macro
     name: str
-    start: int         # byte offset
-    end: int           # byte offset (end of entity)
+    start: int
+    end: int
     storage: str       # extern | static | inline | static_inline
     decl_sig: str
     eff_sig: str
     gid: str
+    # NEW:
+    sig_id: str        # canonical signature id
+    linkage: str       # 'internal' | 'external'
 
+
+def _extract_includes_from_tu(tu: cindex.TranslationUnit, filename: str) -> List[Tuple[str, str]]:
+    """
+    Returns a list of (resolved_path, kind) where kind in {"quote","angle"}.
+    Only returns includes that libclang resolves to a real file path.
+    """
+    out: List[Tuple[str, str]] = []
+    for cur in tu.cursor.get_children():
+        if cur.kind != cindex.CursorKind.INCLUSION_DIRECTIVE:
+            continue
+        inc_file = cur.get_included_file()
+        if not inc_file:
+            continue
+        path = inc_file.name
+        # Heuristic kind from token spelling (#include "x.h" vs <x.h>)
+        kind = "quote"
+        try:
+            toks = list(cur.get_tokens())
+            # For '#include "util.h"', token spellings often contain a single token '"util.h"'
+            if any(t.spelling.startswith("<") for t in toks):
+                kind = "angle"
+        except Exception:
+            pass
+        out.append((path, kind))
+    return out
+
+def scan_includes_file(filename: str, *, extra_args: Optional[Iterable[str]] = None) -> List[Tuple[str, str]]:
+    """
+    Parse a real file with libclang and return (resolved_path, kind) includes.
+    """
+    idx = cindex.Index.create()
+    args = _clang_args_for(filename, extra_args)
+    tu = idx.parse(
+        path=filename,
+        args=args,
+        options=cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+    )
+    return _extract_includes_from_tu(tu, filename)
+
+def scan_includes_code(code: str, *, filename: str = "snippet.c",
+                       extra_args: Optional[Iterable[str]] = None) -> List[Tuple[str, str]]:
+    """
+    Parse unsaved code (for tests) and return (resolved_path, kind) includes.
+    Resolution works if libclang can locate the header on disk via include paths.
+    """
+    idx = cindex.Index.create()
+    args = _clang_args_for(filename, extra_args)
+    tu = idx.parse(
+        path=filename,
+        args=args,
+        unsaved_files=[(filename, code)],
+        options=cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+    )
+    return _extract_includes_from_tu(tu, filename)
+    
 def _has_inline_token(cur: cindex.Cursor) -> bool:
     try:
         for tok in cur.get_tokens():
@@ -92,9 +123,22 @@ def _storage_of(cur: cindex.Cursor) -> str:
         return "inline"
     return "extern"
 
+def _linkage_of(storage: str) -> str:
+    """Map storage → linkage domain."""
+    if storage in ("static", "static_inline"):
+        return "internal"
+    return "external"
+
 def _effsig(cur: cindex.Cursor) -> str:
     t = cur.type.spelling or cur.displayname or cur.spelling
     return " ".join(t.split())
+
+def _canonicalize_sig_text(sig: str) -> str:
+    # Aggressive whitespace normalization; keep it simple and stable.
+    return " ".join((sig or "").split())
+
+def _sig_id_for(sig: str) -> str:
+    return short_id("sig", _canonicalize_sig_text(sig))
 
 def _extent_offsets(ext: cindex.SourceRange) -> Tuple[int, int]:
     return ext.start.offset, ext.end.offset
@@ -133,31 +177,38 @@ def _collect_entities(tu: cindex.TranslationUnit, filename: str) -> List[Entity]
             decl = _fn_signature(cur)
             eff  = _effsig(cur)
             kind = "fn" if cur.is_definition() else "prototype"
-            # FIX: include decl_sig to avoid collisions between same-typed functions
-            gid  = _short_id("fn" if cur.is_definition() else "proto", decl, eff, storage, filename)
-            ents.append(Entity(kind, cur.spelling, s, e, storage, decl, eff, gid))
+            gid  = short_id("fn" if cur.is_definition() else "proto", decl, eff, storage, filename)
+            sig_id   = _sig_id_for(eff)
+            linkage  = _linkage_of(storage)
+            ents.append(Entity(kind, cur.spelling, s, e, storage, decl, eff, gid, sig_id, linkage))
         elif k in (cindex.CursorKind.STRUCT_DECL, cindex.CursorKind.UNION_DECL, cindex.CursorKind.ENUM_DECL):
             if not cur.is_definition():
                 continue
             s, e = _extent_offsets(cur.extent)
             eff  = _record_sig(cur)
             kind = "struct" if k == cindex.CursorKind.STRUCT_DECL else ("union" if k == cindex.CursorKind.UNION_DECL else "enum")
-            gid  = _short_id(kind, eff, "extern", filename)
-            ents.append(Entity(kind, cur.spelling or "<anonymous>", s, e, "extern", eff, eff, gid))
+            gid  = short_id(kind, eff, "extern", filename)
+            sig_id  = _sig_id_for(eff)
+            linkage = "external"
+            ents.append(Entity(kind, cur.spelling or "<anonymous>", s, e, "extern", eff, eff, gid, sig_id, linkage))
         elif k == cindex.CursorKind.TYPEDEF_DECL:
             s, e = _extent_offsets(cur.extent)
             decl = _typedef_sig(cur)
             eff  = _effsig(cur)
-            gid  = _short_id("typedef", eff, "extern", filename)
-            ents.append(Entity("typedef", cur.spelling, s, e, "extern", decl, eff, gid))
+            gid  = short_id("typedef", eff, "extern", filename)
+            sig_id  = _sig_id_for(eff)
+            linkage = "external"
+            ents.append(Entity("typedef", cur.spelling, s, e, "extern", decl, eff, gid, sig_id, linkage))
         elif k == cindex.CursorKind.MACRO_DEFINITION:
             if not _macro_is_function_like(cur):
                 continue
             s, e = _extent_offsets(cur.extent)
             name = cur.spelling
             eff  = f"#define {name}(...)"
-            gid  = _short_id("macro", name, filename)
-            ents.append(Entity("macro", name, s, e, "extern", eff, eff, gid))
+            gid  = short_id("macro", name, filename)
+            sig_id  = _sig_id_for(eff)
+            linkage = "external"
+            ents.append(Entity("macro", name, s, e, "extern", eff, eff, gid, sig_id, linkage))
     ents.sort(key=lambda x: (x.start, x.end))
     return ents
 

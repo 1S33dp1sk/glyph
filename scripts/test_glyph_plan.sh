@@ -15,6 +15,7 @@ die() { printf "\033[1;31m[!] %s\033[0m\n" "$*" >&2; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/glyphplan.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+export WORK
 
 DEMO="$WORK/demo"; DB="$WORK/idx.sqlite"
 mkdir -p "$DEMO"/{src,include}
@@ -56,12 +57,37 @@ test -n "$GID_MAIN" || die "main gid not found"
 $GLYPH_BIN db callees --db "$DB" "$GID_MAIN" | grep -q '<unresolved:inc_int>' \
   || die "expected unresolved inc_int in callees(main)"
 
-# --- explain (deterministic path) ---
+# --- explain (deterministic path) with robust diagnostics ---
 msg "plan explain (json shape)"
-EXPL="$($GLYPH_BIN plan explain --db "$DB" --json)"
-echo "$EXPL" | python3 - <<'PY' || die "explain json malformed"
+EXPL_OUT="$WORK/explain.out.json"
+EXPL_ERR="$WORK/explain.err.txt"
+
+set +e
+$GLYPH_BIN plan explain --db "$DB" --json >"$EXPL_OUT" 2>"$EXPL_ERR"
+rc=$?
+set -e
+
+if [[ $rc -ne 0 ]]; then
+  echo "[!] glyph plan explain failed (rc=$rc)" >&2
+  echo "--- stdout (first 200 lines) ---" >&2
+  sed -n '1,200p' "$EXPL_OUT" >&2 || true
+  echo "--- stderr (first 200 lines) ---" >&2
+  sed -n '1,200p' "$EXPL_ERR" >&2 || true
+  die "plan explain failed"
+fi
+
+if [[ ! -s "$EXPL_OUT" ]]; then
+  echo "[!] glyph plan explain produced empty stdout" >&2
+  echo "--- stderr (first 200 lines) ---" >&2
+  sed -n '1,200p' "$EXPL_ERR" >&2 || true
+  die "explain json malformed"
+fi
+
+python3 - "$EXPL_OUT" <<'PY'
 import json, sys
-j=json.load(sys.stdin)
+p = sys.argv[1]
+with open(p, 'r', encoding='utf-8') as f:
+    j = json.load(f)
 assert "files" in j and isinstance(j["files"], int)
 assert "entities_by_kind" in j and isinstance(j["entities_by_kind"], dict)
 assert "unresolved_calls" in j and isinstance(j["unresolved_calls"], int)
@@ -143,15 +169,35 @@ msg "plan status (after) — expect resolved"
 $GLYPH_BIN plan status --db "$DB" --plan "$PLAN" | tee "$WORK/status_after.json" | \
   grep -q '"unresolved_ok": "yes"' || die "status AFTER should report unresolved_ok=yes"
 
-# --- impact: symbol inc_int should now have a caller (main) ---
+# --- plan impact (json shape) ---
 msg "plan impact (json shape)"
-IMPACT="$($GLYPH_BIN plan impact --db "$DB" --symbol inc_int --json)"
-echo "$IMPACT" | python3 - <<'PY' || exit 1
+test -f "$DB" || die "DB missing at $DB"
+
+IMPACT_JSON="$WORK/impact.json"
+IMPACT_LOG="$WORK/impact.log"
+
+# capture both streams; ensure stdout is saved
+if ! $GLYPH_BIN plan impact --db "$DB" --symbol inc_int --json --verbose >"$IMPACT_JSON" 2>"$IMPACT_LOG"; then
+  echo "[!] glyph plan impact failed (non-zero rc)" >&2
+  echo "---- impact.log (first 200 lines) ----" >&2
+  sed -n '1,200p' "$IMPACT_LOG" >&2 || true
+  die "plan impact failed"
+fi
+
+if [[ ! -s "$IMPACT_JSON" ]]; then
+  echo "[!] bad JSON from plan impact (empty stdout)" >&2
+  echo "---- impact.log (first 200 lines) ----" >&2
+  sed -n '1,200p' "$IMPACT_LOG" >&2 || true
+  die "plan impact produced no output"
+fi
+
+python3 - "$IMPACT_JSON" <<'PY'
 import json, sys
-j=json.load(sys.stdin)
+p = sys.argv[1]
+with open(p,'r',encoding='utf-8') as f:
+    j = json.load(f)
 assert j.get("target") == "inc_int"
 assert "callers" in j and isinstance(j["callers"], dict)
-# Not asserting exact GIDs; just require at least one caller edge present
 ok_any = any(len(v) > 0 for v in j["callers"].values())
 if not ok_any:
     print("no callers found in impact output", file=sys.stderr)
@@ -163,23 +209,57 @@ if command -v ollama >/dev/null 2>&1 && ollama list 2>/dev/null | grep -q 'gpt-o
   msg "plan propose (AI, schema checks only)"
   GOALS=$'1) Implement inc_int\n2) Ensure no unresolved calls'
   RES=$'sqlite fts5\nollama gpt-oss:20b\nlibclang'
-  AIPLAN="$($GLYPH_BIN plan propose \
+
+  PROP_OUT="$WORK/propose.out.json"
+  PROP_ERR="$WORK/propose.err.txt"
+
+  set +e
+  $GLYPH_BIN plan propose \
     --db "$DB" \
     --goals "$GOALS" \
     --resources "$RES" \
     --model gpt-oss:20b --endpoint http://localhost:11434 \
     --max-iters 3 --fallback-after 2 --fallback-threshold 70 \
-    2>/dev/null || true)"
-  # Validate JSON schema minimally
-  echo "$AIPLAN" | python3 - <<'PY' || { echo "[!] AI plan failed schema check"; exit 1; }
+    >"$PROP_OUT" 2>"$PROP_ERR"
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    echo "[!] plan propose failed (rc=$rc)"
+    echo "--- stdout (first 200) ---"; sed -n '1,200p' "$PROP_OUT" || true
+    echo "--- stderr (first 200) ---"; sed -n '1,200p' "$PROP_ERR" || true
+    die "plan propose failed"
+  fi
+
+  if [[ ! -s "$PROP_OUT" ]]; then
+    echo "[!] plan propose produced empty output"
+    echo "--- stderr (first 200) ---"; sed -n '1,200p' "$PROP_ERR" || true
+    die "plan propose empty"
+  fi
+
+  # Validate it is JSON
+  if ! python3 - "$PROP_OUT" <<'PY'
+import json, sys; json.load(open(sys.argv[1], 'r', encoding='utf-8'))
+PY
+  then
+    echo "[!] plan propose emitted non-JSON"
+    echo "--- stdout (first 200) ---"; sed -n '1,200p' "$PROP_OUT" || true
+    echo "--- stderr (first 200) ---"; sed -n '1,200p' "$PROP_ERR" || true
+    die "AI plan failed schema check"
+  fi
+
+  # Schema sanity
+  python3 - "$PROP_OUT" <<'PY'
 import json, sys
-j=json.load(sys.stdin)
+j=json.load(open(sys.argv[1], 'r', encoding='utf-8'))
 for k in ("goals","resources","steps","risks","success_criteria","open_questions"):
     assert k in j
 assert isinstance(j["steps"], list) and len(j["steps"]) >= 1
 PY
+
 else
   msg "plan propose — skipped (no ollama/model)"
 fi
+
 
 msg "ALL OK"
